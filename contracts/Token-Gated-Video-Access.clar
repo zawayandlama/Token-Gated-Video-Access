@@ -9,6 +9,7 @@
 (define-constant err-video-not-active (err u106))
 (define-constant err-invalid-duration (err u107))
 (define-constant err-unauthorized (err u108))
+(define-constant err-self-referral (err u109))
 
 (define-constant access-type-single u1)
 (define-constant access-type-season u2)
@@ -16,6 +17,7 @@
 
 (define-data-var video-counter uint u0)
 (define-data-var platform-fee-basis-points uint u250)
+(define-data-var referral-reward-basis-points uint u500)
 
 (define-map videos
   { video-id: uint }
@@ -70,6 +72,16 @@
   { total-earned: uint, withdrawable: uint }
 )
 
+(define-map referral-stats
+  { referrer: principal }
+  { total-referrals: uint, total-earned: uint }
+)
+
+(define-map user-referrer
+  { user: principal }
+  { referrer: principal }
+)
+
 (define-public (create-video 
     (title (string-ascii 100))
     (description (string-ascii 500))
@@ -112,6 +124,18 @@
   )
 )
 
+(define-public (register-referral (referrer principal))
+  (begin
+    (asserts! (not (is-eq tx-sender referrer)) err-self-referral)
+    (asserts! (is-none (map-get? user-referrer { user: tx-sender })) err-already-exists)
+    (map-set user-referrer
+      { user: tx-sender }
+      { referrer: referrer }
+    )
+    (ok true)
+  )
+)
+
 (define-public (purchase-single-access (video-id uint))
   (let
     (
@@ -119,14 +143,23 @@
       (price (get price-single video-data))
       (creator (get creator video-data))
       (platform-fee (/ (* price (var-get platform-fee-basis-points)) u10000))
-      (creator-amount (- price platform-fee))
+      (referral-reward (/ (* price (var-get referral-reward-basis-points)) u10000))
+      (creator-amount (- (- price platform-fee) referral-reward))
       (current-height (default-to u0 (get-stacks-block-info? time u0)))
+      (referrer-data (map-get? user-referrer { user: tx-sender }))
     )
     (asserts! (get is-active video-data) err-video-not-active)
     (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-payment)
     
     (try! (stx-transfer? platform-fee tx-sender contract-owner))
     (try! (stx-transfer? creator-amount tx-sender creator))
+    (match referrer-data
+      ref-info (begin
+        (try! (stx-transfer? referral-reward tx-sender (get referrer ref-info)))
+        (update-referral-stats (get referrer ref-info) referral-reward)
+      )
+      (try! (stx-transfer? referral-reward tx-sender creator))
+    )
     
     (map-set video-access
       { user: tx-sender, video-id: video-id }
@@ -155,14 +188,23 @@
   (let
     (
       (platform-fee (/ (* price (var-get platform-fee-basis-points)) u10000))
-      (creator-amount (- price platform-fee))
+      (referral-reward (/ (* price (var-get referral-reward-basis-points)) u10000))
+      (creator-amount (- (- price platform-fee) referral-reward))
       (current-height (default-to u0 (get-stacks-block-info? time u0)))
+      (referrer-data (map-get? user-referrer { user: tx-sender }))
     )
     (asserts! (> price u0) err-invalid-pricing)
     (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-payment)
     
     (try! (stx-transfer? platform-fee tx-sender contract-owner))
     (try! (stx-transfer? creator-amount tx-sender creator))
+    (match referrer-data
+      ref-info (begin
+        (try! (stx-transfer? referral-reward tx-sender (get referrer ref-info)))
+        (update-referral-stats (get referrer ref-info) referral-reward)
+      )
+      (try! (stx-transfer? referral-reward tx-sender creator))
+    )
     
     (map-set season-access
       { user: tx-sender, creator: creator, season-id: season-id }
@@ -181,14 +223,23 @@
   (let
     (
       (platform-fee (/ (* price (var-get platform-fee-basis-points)) u10000))
-      (creator-amount (- price platform-fee))
+      (referral-reward (/ (* price (var-get referral-reward-basis-points)) u10000))
+      (creator-amount (- (- price platform-fee) referral-reward))
       (current-height (default-to u0 (get-stacks-block-info? time u0)))
+      (referrer-data (map-get? user-referrer { user: tx-sender }))
     )
     (asserts! (> price u0) err-invalid-pricing)
     (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-payment)
     
     (try! (stx-transfer? platform-fee tx-sender contract-owner))
     (try! (stx-transfer? creator-amount tx-sender creator))
+    (match referrer-data
+      ref-info (begin
+        (try! (stx-transfer? referral-reward tx-sender (get referrer ref-info)))
+        (update-referral-stats (get referrer ref-info) referral-reward)
+      )
+      (try! (stx-transfer? referral-reward tx-sender creator))
+    )
     
     (map-set lifetime-access
       { user: tx-sender, creator: creator }
@@ -252,6 +303,15 @@
   )
 )
 
+(define-public (set-referral-reward (new-reward-basis-points uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-reward-basis-points u2000) err-invalid-pricing)
+    (var-set referral-reward-basis-points new-reward-basis-points)
+    (ok true)
+  )
+)
+
 (define-read-only (has-access (user principal) (video-id uint))
   (let
     (
@@ -303,6 +363,20 @@
   (ok (var-get platform-fee-basis-points))
 )
 
+(define-read-only (get-referral-reward-rate)
+  (ok (var-get referral-reward-basis-points))
+)
+
+(define-read-only (get-referral-stats (referrer principal))
+  (ok (default-to { total-referrals: u0, total-earned: u0 }
+    (map-get? referral-stats { referrer: referrer })
+  ))
+)
+
+(define-read-only (get-user-referrer (user principal))
+  (ok (map-get? user-referrer { user: user }))
+)
+
 (define-read-only (get-total-videos)
   (ok (var-get video-counter))
 )
@@ -319,6 +393,24 @@
       {
         total-earned: (+ (get total-earned current-earnings) amount),
         withdrawable: (+ (get withdrawable current-earnings) amount)
+      }
+    )
+    true
+  )
+)
+
+(define-private (update-referral-stats (referrer principal) (amount uint))
+  (let
+    (
+      (current-stats (default-to { total-referrals: u0, total-earned: u0 }
+        (map-get? referral-stats { referrer: referrer })
+      ))
+    )
+    (map-set referral-stats
+      { referrer: referrer }
+      {
+        total-referrals: (+ (get total-referrals current-stats) u1),
+        total-earned: (+ (get total-earned current-stats) amount)
       }
     )
     true
