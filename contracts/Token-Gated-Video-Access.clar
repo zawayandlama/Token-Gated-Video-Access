@@ -10,6 +10,7 @@
 (define-constant err-invalid-duration (err u107))
 (define-constant err-unauthorized (err u108))
 (define-constant err-self-referral (err u109))
+(define-constant err-self-gift (err u110))
 
 (define-constant access-type-single u1)
 (define-constant access-type-season u2)
@@ -80,6 +81,16 @@
 (define-map user-referrer
   { user: principal }
   { referrer: principal }
+)
+
+(define-map gift-stats
+  { gifter: principal }
+  { total-gifts: uint, total-spent: uint }
+)
+
+(define-map recipient-gifts
+  { recipient: principal }
+  { total-received: uint }
 )
 
 (define-public (create-video 
@@ -180,6 +191,130 @@
     )
     
     (update-creator-earnings creator creator-amount)
+    (ok true)
+  )
+)
+
+(define-public (gift-single-access (video-id uint) (recipient principal))
+  (let
+    (
+      (video-data (unwrap! (map-get? videos { video-id: video-id }) err-not-found))
+      (price (get price-single video-data))
+      (creator (get creator video-data))
+      (platform-fee (/ (* price (var-get platform-fee-basis-points)) u10000))
+      (referral-reward (/ (* price (var-get referral-reward-basis-points)) u10000))
+      (creator-amount (- (- price platform-fee) referral-reward))
+      (current-height (default-to u0 (get-stacks-block-info? time u0)))
+      (referrer-data (map-get? user-referrer { user: recipient }))
+    )
+    (asserts! (not (is-eq tx-sender recipient)) err-self-gift)
+    (asserts! (get is-active video-data) err-video-not-active)
+    (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-payment)
+    
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    (try! (stx-transfer? creator-amount tx-sender creator))
+    (match referrer-data
+      ref-info (begin
+        (try! (stx-transfer? referral-reward tx-sender (get referrer ref-info)))
+        (update-referral-stats (get referrer ref-info) referral-reward)
+      )
+      (try! (stx-transfer? referral-reward tx-sender creator))
+    )
+    
+    (map-set video-access
+      { user: recipient, video-id: video-id }
+      {
+        access-type: access-type-single,
+        granted-at: current-height,
+        expires-at: (some (+ current-height u1440)),
+        season-id: (get season-id video-data)
+      }
+    )
+    
+    (map-set videos
+      { video-id: video-id }
+      (merge video-data {
+        total-views: (+ (get total-views video-data) u1),
+        total-revenue: (+ (get total-revenue video-data) price)
+      })
+    )
+    
+    (update-creator-earnings creator creator-amount)
+    (update-gift-stats tx-sender price)
+    (update-recipient-gifts recipient)
+    (ok true)
+  )
+)
+
+(define-public (gift-season-access (creator principal) (season-id uint) (price uint) (recipient principal))
+  (let
+    (
+      (platform-fee (/ (* price (var-get platform-fee-basis-points)) u10000))
+      (referral-reward (/ (* price (var-get referral-reward-basis-points)) u10000))
+      (creator-amount (- (- price platform-fee) referral-reward))
+      (current-height (default-to u0 (get-stacks-block-info? time u0)))
+      (referrer-data (map-get? user-referrer { user: recipient }))
+    )
+    (asserts! (not (is-eq tx-sender recipient)) err-self-gift)
+    (asserts! (> price u0) err-invalid-pricing)
+    (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-payment)
+    
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    (try! (stx-transfer? creator-amount tx-sender creator))
+    (match referrer-data
+      ref-info (begin
+        (try! (stx-transfer? referral-reward tx-sender (get referrer ref-info)))
+        (update-referral-stats (get referrer ref-info) referral-reward)
+      )
+      (try! (stx-transfer? referral-reward tx-sender creator))
+    )
+    
+    (map-set season-access
+      { user: recipient, creator: creator, season-id: season-id }
+      {
+        granted-at: current-height,
+        expires-at: (some (+ current-height u10080))
+      }
+    )
+    
+    (update-creator-earnings creator creator-amount)
+    (update-gift-stats tx-sender price)
+    (update-recipient-gifts recipient)
+    (ok true)
+  )
+)
+
+(define-public (gift-lifetime-access (creator principal) (price uint) (recipient principal))
+  (let
+    (
+      (platform-fee (/ (* price (var-get platform-fee-basis-points)) u10000))
+      (referral-reward (/ (* price (var-get referral-reward-basis-points)) u10000))
+      (creator-amount (- (- price platform-fee) referral-reward))
+      (current-height (default-to u0 (get-stacks-block-info? time u0)))
+      (referrer-data (map-get? user-referrer { user: recipient }))
+    )
+    (asserts! (not (is-eq tx-sender recipient)) err-self-gift)
+    (asserts! (> price u0) err-invalid-pricing)
+    (asserts! (>= (stx-get-balance tx-sender) price) err-insufficient-payment)
+    
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    (try! (stx-transfer? creator-amount tx-sender creator))
+    (match referrer-data
+      ref-info (begin
+        (try! (stx-transfer? referral-reward tx-sender (get referrer ref-info)))
+        (update-referral-stats (get referrer ref-info) referral-reward)
+      )
+      (try! (stx-transfer? referral-reward tx-sender creator))
+    )
+    
+    (map-set lifetime-access
+      { user: recipient, creator: creator }
+      { granted-at: current-height }
+    )
+    
+    (update-creator-earnings creator creator-amount)
+    (update-gift-stats tx-sender price)
+    (update-recipient-gifts recipient)
     (ok true)
   )
 )
@@ -422,4 +557,49 @@
     creator: creator,
     total-videos: (var-get video-counter)
   })
+)
+
+(define-read-only (get-gift-stats (gifter principal))
+  (ok (default-to { total-gifts: u0, total-spent: u0 }
+    (map-get? gift-stats { gifter: gifter })
+  ))
+)
+
+(define-read-only (get-recipient-gifts (recipient principal))
+  (ok (default-to { total-received: u0 }
+    (map-get? recipient-gifts { recipient: recipient })
+  ))
+)
+
+(define-private (update-gift-stats (gifter principal) (amount uint))
+  (let
+    (
+      (current-stats (default-to { total-gifts: u0, total-spent: u0 }
+        (map-get? gift-stats { gifter: gifter })
+      ))
+    )
+    (map-set gift-stats
+      { gifter: gifter }
+      {
+        total-gifts: (+ (get total-gifts current-stats) u1),
+        total-spent: (+ (get total-spent current-stats) amount)
+      }
+    )
+    true
+  )
+)
+
+(define-private (update-recipient-gifts (recipient principal))
+  (let
+    (
+      (current-gifts (default-to { total-received: u0 }
+        (map-get? recipient-gifts { recipient: recipient })
+      ))
+    )
+    (map-set recipient-gifts
+      { recipient: recipient }
+      { total-received: (+ (get total-received current-gifts) u1) }
+    )
+    true
+  )
 )
